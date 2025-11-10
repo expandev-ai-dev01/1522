@@ -161,3 +161,13 @@ export function errorResponse(message: string): object {
     timestamp: new Date().toISOString(),
   };
 }
+
+/**
+ * @constant StatusGeneralError
+ * @description Standard general error object
+ */
+export const StatusGeneralError = {
+  statusCode: 500,
+  code: 'GENERAL_ERROR',
+  message: 'An error occurred while processing your request',
+};

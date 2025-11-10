@@ -7,17 +7,18 @@
  */
 
 import { Router } from 'express';
+import * as songController from '@/api/v1/internal/song/controller';
 
 const router = Router();
 
 /**
- * @rule {be-internal-routes-placeholder}
- * Internal routes will be added here as features are implemented.
- * All internal routes require authentication middleware.
- * Examples:
- * - /api/v1/internal/song
- * - /api/v1/internal/playlist
- * - /api/v1/internal/category
+ * @rule {be-song-routes}
+ * Song management routes - /api/v1/internal/song
  */
+router.get('/song', songController.listHandler);
+router.post('/song', songController.createHandler);
+router.get('/song/:id', songController.getHandler);
+router.put('/song/:id', songController.updateHandler);
+router.delete('/song/:id', songController.deleteHandler);
 
 export default router;
