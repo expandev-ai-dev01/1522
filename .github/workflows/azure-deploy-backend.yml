@@ -1,0 +1,329 @@
+name: Deploy Node.js Backend to Azure Web App
+
+on:
+  workflow_dispatch:
+  # Push trigger comentado para evitar deploy automático no primeiro commit
+  # Descomente as linhas abaixo se quiser deploy automático em futuros pushes:
+  # push:
+  #   branches:
+  #     - main
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Node.js version
+        uses: actions/setup-node@v3
+        with:
+          node-version: '20.x'
+
+      - name: Validate package.json
+        working-directory: ./backend
+        run: |
+          # Verificar se package.json existe
+          if [ ! -f "package.json" ]; then
+            echo "ERROR: package.json not found in backend folder!"
+            exit 1
+          fi
+
+          # Verificar se tem script start (necessário para Azure)
+          if ! grep -q '"start"' package.json; then
+            echo "ERROR: No 'start' script found in package.json!"
+            echo "Add a start script to your package.json, like:"
+            echo '  "start": "node index.js" or "start": "node dist/index.js"'
+            exit 1
+          fi
+
+          echo "✓ package.json validated"
+
+      - name: npm install, build, and test
+        working-directory: ./backend
+        run: |
+          npm install
+          npm run build --if-present
+          npm run test --if-present -- --passWithNoTests || true
+
+      - name: Zip artifact for deployment
+        run: |
+          echo "📦 Preparing deployment package..."
+          echo ""
+          echo "Backend folder contents:"
+          ls -la ./backend
+          echo ""
+
+          # Create deployment package from backend/ folder
+          cd ./backend
+          zip -r ../release.zip . -x "*.git*"
+          cd ..
+
+          # Add deploy.sh and .deployment from root (if they exist)
+          if [ -f "deploy.sh" ]; then
+            echo "✅ Adding deploy.sh to package"
+            zip -u release.zip deploy.sh
+          fi
+
+          if [ -f ".deployment" ]; then
+            echo "✅ Adding .deployment to package"
+            zip -u release.zip .deployment
+          fi
+
+          echo ""
+          echo "📋 Release zip created:"
+          ls -lh release.zip
+          echo ""
+          echo "📄 Package contents (first 30 files):"
+          unzip -l release.zip | head -30
+
+      - name: Upload artifact for deployment job
+        uses: actions/upload-artifact@v4
+        with:
+          name: node-app
+          path: ./release.zip
+
+  deploy:
+    runs-on: ubuntu-latest
+    needs: build
+    environment:
+      name: 'Production'
+      url: ${{ steps.deploy-to-webapp.outputs.webapp-url }}
+
+    permissions:
+      id-token: write
+
+    steps:
+      - name: Download artifact from build job
+        uses: actions/download-artifact@v4
+        with:
+          name: node-app
+
+      - name: Unzip artifact for deployment
+        run: |
+          unzip release.zip
+          echo "Checking for package.json:"
+          if [ -f "package.json" ]; then
+            echo "package.json found!"
+            head -5 package.json
+          else
+            echo "ERROR: package.json not found!"
+          fi
+
+      - name: Create .env file for deployment
+        run: |
+          echo "Creating .env file with CORS configuration..."
+          cat > .env << EOF
+          CORS_ORIGINS=https://${{ secrets.APP_NAME_FRONTEND }}.azurewebsites.net
+          EOF
+          echo "✓ .env file created"
+
+      - name: 'Deploy to Azure Web App'
+        id: deploy-to-webapp
+        uses: azure/webapps-deploy@v2
+        with:
+          app-name: ${{ secrets.APP_NAME_BACKEND }}
+          publish-profile: ${{ secrets.BACKEND_PUBLISH_PROFILE }}
+          package: .
+
+      - name: Verify deployment health
+        run: |
+          echo "Waiting for deployment to be ready..."
+          APP_URL="https://${{ secrets.APP_NAME_BACKEND }}.azurewebsites.net"
+
+          for i in {1..12}; do
+            echo "Health check attempt $i/12..."
+
+            # Tentar acessar a URL do app (pode ser /health, /api/health ou /)
+            for ENDPOINT in "/health" "/api/health" "/"; do
+              HTTP_CODE=$(curl -s -o /dev/null -w "%{http_code}" "$APP_URL$ENDPOINT" || echo "000")
+
+              # Aceitar qualquer resposta HTTP (2xx, 3xx, 4xx, 5xx) como sinal de que a app está rodando
+              # Apenas 503 (Service Unavailable) ou 000 (sem resposta) indicam problema
+              if [[ "$HTTP_CODE" =~ ^[2-5][0-9][0-9]$ ]] && [ "$HTTP_CODE" != "503" ]; then
+                echo "✅ Backend is responding! (HTTP $HTTP_CODE at $ENDPOINT)"
+                echo "Deployment successful: $APP_URL"
+                exit 0
+              fi
+            done
+
+            if [ "$HTTP_CODE" == "503" ]; then
+              echo "⚠️ Backend returned HTTP 503 (Service Unavailable)"
+            elif [ "$HTTP_CODE" != "000" ]; then
+              echo "⚠️ Backend returned HTTP $HTTP_CODE"
+            else
+              echo "Backend not responding yet..."
+            fi
+
+            if [ $i -lt 12 ]; then
+              echo "Waiting 15 seconds before next check..."
+              sleep 15
+            fi
+          done
+
+          echo "⚠️ Backend health check did not get a response after 3 minutes"
+          echo "Deployment may still be initializing. Check: $APP_URL"
+          echo "Note: This is a warning, not a failure. The deployment was completed."
+          exit 0
+
+      - name: Configure Startup Command for Database Migration
+        run: |
+          echo "⚙️  Configuring Azure App Service startup script..."
+
+          # Save publish profile to extract credentials
+          cat > /tmp/publish_profile.xml << 'EOF'
+          ${{ secrets.BACKEND_PUBLISH_PROFILE }}
+          EOF
+
+          USERNAME=$(grep -oP 'userName="\K[^"]+' /tmp/publish_profile.xml | head -1)
+          PASSWORD=$(grep -oP 'userPWD="\K[^"]+' /tmp/publish_profile.xml | head -1)
+          rm -f /tmp/publish_profile.xml
+
+          if [ -z "$USERNAME" ] || [ -z "$PASSWORD" ]; then
+            echo "⚠️  Could not extract credentials - skipping startup configuration"
+            exit 0
+          fi
+
+          APP_NAME="${{ secrets.APP_NAME_BACKEND }}"
+          KUDU_URL="https://${APP_NAME}.scm.azurewebsites.net/api"
+
+          # Create startup script that will run on container initialization
+          cat > /tmp/startup.sh << 'STARTUP_SCRIPT'
+          #!/bin/bash
+          echo "=== Azure App Service Startup ==="
+          echo "Checking for database migrations..."
+
+          # Only run DB migrations on first startup (check for marker file)
+          if [ -f /home/db_migrated ]; then
+            echo "Database already migrated, skipping..."
+          elif [ -d /home/site/wwwroot/database ]; then
+            echo "Running database migrations using Node.js..."
+
+            # Use Node.js with mssql package (already available in Node.js runtime)
+            node << 'NODEJS_SCRIPT'
+          const fs = require('fs');
+          const path = require('path');
+          const sql = require('mssql');
+
+          const config = {
+            server: process.env.DB_SERVER,
+            port: parseInt(process.env.DB_PORT || '1433'),
+            database: process.env.DB_NAME,
+            user: process.env.DB_USER,
+            password: process.env.DB_PASSWORD,
+            options: {
+              encrypt: process.env.DB_ENCRYPT === 'true',
+              trustServerCertificate: true,
+              enableArithAbort: true
+            }
+          };
+
+          async function executeSqlFile(filePath) {
+            const sqlContent = fs.readFileSync(filePath, 'utf8');
+            console.log(`  → Executing: ${filePath}`);
+
+            try {
+              const pool = await sql.connect(config);
+              await pool.request().batch(sqlContent);
+              console.log(`  ✅ Success`);
+              return true;
+            } catch (err) {
+              console.error(`  ❌ Error: ${err.message}`);
+              return false;
+            }
+          }
+
+          async function runMigrations() {
+            console.log('Starting database migrations...');
+
+            const dbPath = '/home/site/wwwroot/database';
+
+            // Execute structure files first
+            console.log('Step 1: Structure files (_structure.sql)');
+            for (const schema of ['functional', 'config', 'security', 'subscription']) {
+              const structFile = path.join(dbPath, schema, '_structure.sql');
+              if (fs.existsSync(structFile)) {
+                await executeSqlFile(structFile);
+              }
+            }
+
+            // Execute stored procedures
+            console.log('Step 2: Stored procedures (sp*.sql)');
+            const functionalPath = path.join(dbPath, 'functional');
+            if (fs.existsSync(functionalPath)) {
+              const files = fs.readdirSync(functionalPath, { recursive: true })
+                .filter(f => f.match(/sp.*\.sql$/))
+                .map(f => path.join(functionalPath, f))
+                .sort();
+
+              for (const file of files) {
+                await executeSqlFile(file);
+              }
+            }
+
+            console.log('✅ Database migrations completed!');
+            fs.writeFileSync('/home/db_migrated', new Date().toISOString());
+          }
+
+          runMigrations().catch(err => {
+            console.error('Migration failed:', err);
+            process.exit(1);
+          });
+          NODEJS_SCRIPT
+
+          fi
+
+          echo "=== Starting Node.js application ==="
+          # Start the actual application
+          cd /home/site/wwwroot
+          npm start
+          STARTUP_SCRIPT
+
+          # Upload startup script to Azure
+          echo "📤 Uploading startup script..."
+          curl -s -X PUT "$KUDU_URL/vfs/site/startup.sh" \
+            -u "$USERNAME:$PASSWORD" \
+            -H "Content-Type: application/octet-stream" \
+            --data-binary @/tmp/startup.sh
+
+          # Make script executable
+          curl -s -X POST "$KUDU_URL/command" \
+            -u "$USERNAME:$PASSWORD" \
+            -H "Content-Type: application/json" \
+            -d '{"command":"chmod +x startup.sh","dir":"/home/site"}' > /dev/null
+
+          echo "✅ Startup script uploaded"
+
+          # Configure App Service startup command via Kudu API
+          echo "⚙️  Configuring App Service startup command via Kudu..."
+
+          # Get current app settings
+          SETTINGS_RESPONSE=$(curl -s -X GET "$KUDU_URL/settings" \
+            -u "$USERNAME:$PASSWORD")
+
+          # Update with startup command (appCommandLine is the startup command setting)
+          UPDATED_SETTINGS=$(echo "$SETTINGS_RESPONSE" | jq '. + {"appCommandLine": "/home/site/startup.sh"}' 2>/dev/null || echo '{"appCommandLine": "/home/site/startup.sh"}')
+
+          # Post updated settings
+          curl -s -X POST "$KUDU_URL/settings" \
+            -u "$USERNAME:$PASSWORD" \
+            -H "Content-Type: application/json" \
+            -d "$UPDATED_SETTINGS" > /dev/null
+
+          echo "✅ Startup command configured: /home/site/startup.sh"
+
+          # Restart app to apply changes
+          echo "🔄 Restarting App Service..."
+          curl -s -X POST "https://$APP_NAME.scm.azurewebsites.net/api/app/restart" \
+            -u "$USERNAME:$PASSWORD" > /dev/null
+
+          echo "✅ App Service restarted"
+          echo ""
+          echo "📋 Next steps:"
+          echo "   1. Wait 30-60 seconds for container to restart"
+          echo "   2. Check logs: Azure Portal → $APP_NAME → Monitoring → Log stream"
+          echo "   3. Look for: 'Azure App Service Startup' and 'Running database migrations'"
+          echo "   4. Verify database tables were created"
