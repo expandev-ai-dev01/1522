@@ -1,7 +1,7 @@
 /**
  * Database Migration
- * Generated: 2025-11-11T11:58:21.101Z
- * Timestamp: 20251111_115821
+ * Generated: 2025-11-11T12:20:36.754Z
+ * Timestamp: 20251111_122036
  *
  * This migration includes:
  * - Schema structures (tables, indexes, constraints)
@@ -22,7 +22,7 @@ SET NUMERIC_ROUNDABORT OFF;
 GO
 
 PRINT 'Starting database migration...';
-PRINT 'Timestamp: 20251111_115821';
+PRINT 'Timestamp: 20251111_122036';
 GO
 
 
