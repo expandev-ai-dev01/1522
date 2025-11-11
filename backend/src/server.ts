@@ -15,6 +15,7 @@ import { config } from '@/config';
 import { errorMiddleware } from '@/middleware/error';
 import { notFoundMiddleware } from '@/middleware/notFound';
 import apiRoutes from '@/routes';
+import { runDatabaseMigrations } from './migrations/migration-runner';
 
 const app: Application = express();
 
@@ -62,6 +63,36 @@ app.use(notFoundMiddleware);
 app.use(errorMiddleware);
 
 /**
+ * @rule {be-server-startup}
+ * Server startup
+ */
+/**
+ * Application startup with database migrations
+ */
+let server: any;
+
+async function startApplication() {
+  try {
+    // Run database migrations before starting server
+    console.log('Checking database migrations...');
+    await runDatabaseMigrations({
+      skipIfNoNewMigrations: true,
+      logLevel: 'minimal'
+    });
+    console.log('✓ Database ready\n');
+
+    // Start server
+    const server = app.listen(config.api.port, () => {
+  console.log(`Server running on port ${config.api.port} in ${process.env.NODE_ENV} mode`);
+  console.log(`API available at http://localhost:${config.api.port}/api/${config.api.version}`);
+});
+  } catch (error: any) {
+    console.error('Failed to start application:', error.message);
+    process.exit(1);
+  }
+}
+
+/**
  * @rule {be-graceful-shutdown}
  * Graceful shutdown handler
  */
@@ -73,13 +104,8 @@ process.on('SIGTERM', () => {
   });
 });
 
-/**
- * @rule {be-server-startup}
- * Server startup
- */
-const server = app.listen(config.api.port, () => {
-  console.log(`Server running on port ${config.api.port} in ${process.env.NODE_ENV} mode`);
-  console.log(`API available at http://localhost:${config.api.port}/api/${config.api.version}`);
-});
+
+
+startApplication();
 
 export default server;
